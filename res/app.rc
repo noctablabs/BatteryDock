@@ -1,0 +1,33 @@
+#include <winver.h>
+#include "../build/version.h"
+
+// BatteryDock icon "battery shelf" (batterydock_icon.svg for 32 px and up, batterydock_icon_small.svg for 16-24 px).
+1 ICON "app.ico"
+2 ICON "app_light.ico"
+1 24 "app.manifest"
+
+// The built-in UI languages: lang\*.txt joined by the build (see src/i18n.cpp).
+LANGS RCDATA "languages.txt"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION WB_VERSION_RESOURCE
+PRODUCTVERSION WB_VERSION_RESOURCE
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "BatteryDock"
+      VALUE "ProductName", "BatteryDock"
+      VALUE "FileVersion", WB_VERSION_STRING
+      VALUE "ProductVersion", WB_VERSION_STRING
+      VALUE "OriginalFilename", "BatteryDock.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
