@@ -7,8 +7,11 @@
 // Use documented keyboard transaction ids; probe the known ids for other models.
 // Reference: github.com/openrazer/openrazer (protocol documentation in its driver sources).
 #include "drivers.h"
+#include "dpi_source.h"
 
 #include <algorithm>
+#include <memory>
+#include <mutex>
 
 namespace {
 
@@ -26,13 +29,18 @@ BYTE KeyboardBatteryTid(USHORT pid) {
 
 enum class Rz { Ok, Offline, Unsupported, NoReply };
 
-Rz Command(HidDev& d, BYTE tid, BYTE cls, BYTE id, BYTE size, std::vector<BYTE>& args) {
+// The battery poll and the DPI watcher share each device's feature-report mailbox: one request at a time.
+std::mutex g_mailbox;
+
+Rz Command(HidDev& d, BYTE tid, BYTE cls, BYTE id, BYTE size, std::vector<BYTE>& args, BYTE arg0 = 0) {
+    std::lock_guard<std::mutex> lock(g_mailbox);
     std::vector<BYTE> rep(91, 0);  // [0] = report id 0, then the 90-byte report
     BYTE* r = rep.data() + 1;
     r[1] = tid;
     r[5] = size;
     r[6] = cls;
     r[7] = id;
+    r[8] = arg0;
     BYTE crc = 0;
     for (int i = 2; i < 88; i++) crc ^= r[i];
     r[88] = crc;
@@ -164,6 +172,78 @@ void PollRazer(PollContext& ctx) {
                 existing->charging |= s.charging;
             }
             break;
+        }
+    }
+}
+
+// ---- DPI source (custom build) ---------------------------------------------------------------------
+// OpenRazer (driver/razerchromacommon.c, razermouse_driver.c), both read-only:
+//   class 04 id 86 size 0x26, args[0] = 01 (VARSTORE): get DPI stages -> args[1] = active stage id,
+//     args[2] = count, then per stage 7 bytes from args[3]: [id][x hi][x lo][y hi][y lo][00][00]
+//   class 04 id 85 size 0x07, args[0] = 00 (NOSTORE): get DPI -> args[1..2] = x, args[3..4] = y
+// Models without stages answer "not supported" to 86; they get the plain DPI from 85.
+
+namespace {
+
+class RazerDpi : public DpiSource {
+public:
+    RazerDpi(const HidColl& c, std::wstring key) : c_(c), key_(std::move(key)) {}
+    bool Open() { return d_.OpenFeatureOnly(c_); }
+    std::wstring Key() const override { return key_; }
+    USHORT Vid() const override { return 0x1532; }
+    unsigned IntervalMs() const override { return 400; }  // leave room in the mailbox for Synapse
+    bool Read(DpiReading& out) override {
+        if (!tid_ && !FindTid()) return false;
+        std::vector<BYTE> a;
+        if (stages_) {
+            Rz r = Command(d_, tid_, 0x04, 0x86, 0x26, a, 0x01);
+            if (r == Rz::Unsupported) stages_ = false;
+            else if (r != Rz::Ok) return false;
+            else {
+                int active = a[1], count = a[2];
+                if (count >= 1 && count <= 8) {
+                    for (int i = 0; i < count && 3 + i * 7 + 2 < (int)a.size(); i++) {
+                        const BYTE* e = a.data() + 3 + i * 7;
+                        if (e[0] != active) continue;
+                        out.stage = i;
+                        out.count = count;
+                        out.dpi = (e[1] << 8) | e[2];
+                        return out.dpi >= 50 && out.dpi <= 60000;
+                    }
+                }
+                stages_ = false;  // unexpected layout: use the plain DPI from now on
+            }
+        }
+        if (Command(d_, tid_, 0x04, 0x85, 0x07, a, 0x00) != Rz::Ok) return false;
+        out.dpi = (a[1] << 8) | a[2];
+        return out.dpi >= 50 && out.dpi <= 60000;
+    }
+private:
+    bool FindTid() {
+        std::vector<BYTE> a;
+        for (BYTE t : { 0x1F, 0x3F, 0xFF, 0x08 })
+            if (Command(d_, t, 0x04, 0x85, 0x07, a, 0x00) == Rz::Ok) { tid_ = t; return true; }
+        return false;
+    }
+    HidColl c_;
+    HidDev d_;
+    std::wstring key_;
+    BYTE tid_ = 0;
+    bool stages_ = true;
+};
+
+}  // namespace
+
+void FindRazerDpi(const std::vector<HidColl>& colls, DpiSources& out) {
+    std::vector<USHORT> pids;
+    for (const auto& c : colls)
+        if (c.vid == 0x1532 && std::find(pids.begin(), pids.end(), c.pid) == pids.end()) pids.push_back(c.pid);
+    for (USHORT pid : pids) {
+        if (Kind(colls, 0x1532, pid) != DeviceKind::Mouse) continue;
+        for (const auto& c : colls) {
+            if (c.vid != 0x1532 || c.pid != pid || c.featLen() != 91) continue;
+            auto s = std::make_unique<RazerDpi>(c, L"razer:" + Hex4(pid));
+            if (s->Open()) { out.push_back(std::move(s)); break; }
         }
     }
 }

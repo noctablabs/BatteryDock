@@ -11,9 +11,12 @@
 // github.com/Sapd/HeadsetControl (headset voltage calibration); PRO X Wireless: G HUB's power model
 // for 046D:0ABA (pro_headset/pro_x_wireless_headset_battery.xml), checked against G HUB (#3434).
 #include "drivers.h"
+#include "dpi_source.h"
 
 #include <algorithm>
 #include <cwctype>
+#include <memory>
+#include <mutex>
 #include <optional>
 
 namespace {
@@ -27,6 +30,7 @@ bool IsPassthroughDongle(USHORT pid) { return pid == 0xC54F; }
 
 class Hidpp {
 public:
+    BYTE swId = kSwId;  // the DPI watcher uses its own id so its replies never answer the battery poll
     bool Open(const HidColl* shortC, const HidColl* longC) {
         if (shortC) hasShort_ = s_.Open(*shortC);
         if (longC) hasLong_ = l_.Open(*longC);
@@ -38,6 +42,8 @@ public:
     // (code in `err`), -1 = no answer.
     int Request(BYTE idx, BYTE b2, BYTE b3, std::initializer_list<BYTE> params, std::vector<BYTE>& p, BYTE& err,
                 bool forceShort = false, int timeoutMs = 500) {
+        // Several DPI threads can share one receiver (one per paired mouse): one exchange at a time.
+        std::lock_guard<std::mutex> lock(io_);
         bool useLong = hasLong_ && !forceShort;
         if (!useLong && !hasShort_) return -1;
         std::vector<BYTE> msg(useLong ? 20 : 7, 0);
@@ -69,9 +75,9 @@ public:
     }
 
     // HID++ 2.0 call: feature index + function number.
-    int Call(BYTE idx, BYTE feature, BYTE fn, std::initializer_list<BYTE> params, std::vector<BYTE>& p) {
+    int Call(BYTE idx, BYTE feature, BYTE fn, std::initializer_list<BYTE> params, std::vector<BYTE>& p, int timeoutMs = 500) {
         BYTE err = 0;
-        return Request(idx, feature, (BYTE)((fn << 4) | kSwId), params, p, err) == 1 ? 1 : 0;
+        return Request(idx, feature, (BYTE)((fn << 4) | swId), params, p, err, false, timeoutMs) == 1 ? 1 : 0;
     }
 
     BYTE FeatureIndex(BYTE idx, USHORT featureId) {
@@ -81,6 +87,7 @@ public:
     }
 
 private:
+    std::mutex io_;
     HidDev s_, l_;
     bool hasShort_ = false, hasLong_ = false;
 };
@@ -343,5 +350,98 @@ void PollLogitech(PollContext& ctx) {
             if (PollLogitechDevice(ctx, pid, shorts, longs, suffix)) any = true;
         }
         if (any) ctx.Claim(vid, pid);
+    }
+}
+
+// ---- DPI source (custom build) ---------------------------------------------------------------------
+// HID++ 2.0 ADJUSTABLE_DPI (0x2201) getSensorDpi, fn 2: [sensor][dpi hi][dpi lo][default hi][default lo]
+// (0 = the default is in use); EXTENDED_ADJUSTABLE_DPI (0x2202) fn 5: [sensor][x hi][x lo][x default
+// hi][lo][y ...]. Read-only. From Solaar (lib/logitech_receiver/settings_templates.py, AdjustableDpi and
+// ExtendedAdjustableDpi). A mouse in onboard-profile mode may report the profile's DPI; the value is
+// what the mouse itself answers.
+
+namespace {
+
+class LogitechDpi : public DpiSource {
+public:
+    LogitechDpi(std::shared_ptr<Hidpp> h, BYTE idx, BYTE feature, bool extended, std::wstring key)
+        : h_(std::move(h)), idx_(idx), feature_(feature), extended_(extended), key_(std::move(key)) {}
+    std::wstring Key() const override { return key_; }
+    USHORT Vid() const override { return 0x046D; }
+    unsigned IntervalMs() const override { return 300; }
+    bool Read(DpiReading& out) override {
+        std::vector<BYTE> p;
+        if (!h_->Call(idx_, feature_, extended_ ? 5 : 2, { 0 }, p, 300) || p.size() < 5) return false;
+        int dpi = (p[1] << 8) | p[2];
+        if (!dpi) dpi = (p[3] << 8) | p[4];
+        if (dpi < 50 || dpi > 60000) return false;
+        out.dpi = dpi;
+        return true;
+    }
+private:
+    std::shared_ptr<Hidpp> h_;
+    BYTE idx_, feature_;
+    bool extended_;
+    std::wstring key_;
+};
+
+}  // namespace
+
+void FindLogitechDpi(const std::vector<HidColl>& colls, DpiSources& out) {
+    std::vector<std::pair<USHORT, USHORT>> products;
+    for (const auto& c : colls)
+        if (c.vid == 0x046D && std::find(products.begin(), products.end(), std::make_pair(c.vid, c.pid)) == products.end())
+            products.push_back({ c.vid, c.pid });
+    for (auto [vid, pid] : products) {
+        const bool passthrough = IsPassthroughDongle(pid);
+        std::vector<const HidColl*> allShorts, allLongs;
+        for (const auto& c : colls) {
+            if (c.vid != vid || c.pid != pid) continue;
+            if (c.outLen() == 7 && ((c.page() == 0xFF00 && c.usage() == 0x0001) ||
+                                    (passthrough && c.page() == 0xFF43 && c.usage() == 0x0301)))
+                allShorts.push_back(&c);
+            if (c.outLen() == 20 && ((c.page() == 0xFF00 && c.usage() == 0x0002) ||
+                                     (c.page() == 0xFF43 && (c.usage() == 0x0202 || (passthrough && c.usage() == 0x0302)))))
+                allLongs.push_back(&c);
+        }
+        std::vector<std::wstring> groups;
+        for (const auto* list : { &allShorts, &allLongs })
+            for (const HidColl* c : *list) {
+                std::wstring k = PhysicalKey(*c);
+                if (std::find(groups.begin(), groups.end(), k) == groups.end()) groups.push_back(k);
+            }
+        for (size_t g = 0; g < groups.size(); ++g) {
+            const HidColl *sc = nullptr, *lc = nullptr;
+            for (const HidColl* c : allShorts) if (!sc && PhysicalKey(*c) == groups[g]) sc = c;
+            for (const HidColl* c : allLongs) if (!lc && PhysicalKey(*c) == groups[g]) lc = c;
+            auto h = std::make_shared<Hidpp>();
+            h->swId = 0x0E;
+            if (!h->Open(sc, lc)) continue;
+            std::wstring product = HidProduct(lc ? *lc : *sc);
+            bool isReceiver = product.find(L"Receiver") != std::wstring::npos;
+            std::wstring path = (lc ? lc : sc)->path;
+            for (auto& ch : path) ch = towlower(ch);
+            bool bluetooth = path.find(L"{00001812-") != std::wstring::npos || path.find(L"{00001124-") != std::wstring::npos;
+            std::vector<BYTE> p;
+            BYTE err = 0;
+            std::vector<BYTE> indices;
+            if (passthrough) indices = { 1 };
+            else if (bluetooth || (!isReceiver && h->Request(0xFF, 0x00, 0x10 | h->swId, { 0, 0, 0x5A }, p, err, false, 400) == 1 &&
+                                   p.size() >= 3 && p[0] >= 2))
+                indices = { 0xFF };
+            else indices = { 1, 2, 3, 4, 5, 6 };
+            std::wstring suffix = g ? L"#" + std::to_wstring(g + 1) : L"";
+            for (BYTE idx : indices) {
+                if (h->Request(idx, 0x00, 0x10 | h->swId, { 0, 0, 0x5A }, p, err, false, 400) != 1 || p.size() < 3 || p[0] < 2)
+                    continue;  // off, asleep, or a HID++ 1.0 device (no DPI feature)
+                bool extended = true;
+                BYTE f = h->FeatureIndex(idx, 0x2202);
+                if (!f) { extended = false; f = h->FeatureIndex(idx, 0x2201); }
+                if (!f) continue;
+                std::wstring unit = ReadUnitId20(*h, idx);
+                std::wstring key = !unit.empty() ? L"logi:unit:" + unit : L"logi:" + Hex4(pid) + suffix + L":" + std::to_wstring(idx);
+                out.push_back(std::make_unique<LogitechDpi>(h, idx, f, extended, key));
+            }
+        }
     }
 }

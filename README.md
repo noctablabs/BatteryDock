@@ -24,6 +24,10 @@ Orijinal proje belgesi: [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
 - **Her markayı tanıma:** Pili okunamayan cihazlar da üretici kimliğinden markası bulunarak listelenir (90+ marka). Kablolu görünenler varsayılan olarak gizlidir.
 - **Şarjda canlı takip:** Bir cihaz şarj olurken pil 15 saniyede bir okunur. Kontrol aralığına 10 sn ve 15 sn seçenekleri eklendi.
 - **Zıplamayan yüzde:** Şarjda yüzde yalnızca artar, pildeyken yalnızca azalır (60 → 62 → 61 oynamaları gizlenir).
+- **DPI göstergesi:** Mouse'un DPI düğmesine basınca görev çubuğunda, cihazın tam üstünde küçük bir baloncuk yeni DPI'ı gösterir (ör. "1600 DPI", kademeler nokta olarak). 1,5 saniye sonra kaybolur; rengi cihazın ikon rengidir.
+  Desteklenenler: Logitech (HID++), Razer (DPI ve kademe), Wraith W1 SE (değerler mouse'tan okunur), Scyrox V6/V8 (değerler mouse'tan okunur) ve aynı protokolü kullanan ATK, VXE, Pulsar, Kysona, G-Wolves mouse'ları (kademe; değerler *DPI değerleri...* ile girilebilir).
+  Mouse'lara yalnızca okuma sorgusu gider, hiçbir ayar değişmez. Kapatmak için: sağ tık → mouse → *DPI değişince göster*.
+- **Uyanınca hemen güncelleme:** Uyuyan bir mouse kullanılmaya başlayınca pil yüzdesi bir sonraki okumayı beklemeden yenilenir.
 - **Ayar taşıma:** İlk açılışta BatteryHub ayarları (isimler, sıralama, uyarılar) otomatik alınır.
 
 ## Kurulum

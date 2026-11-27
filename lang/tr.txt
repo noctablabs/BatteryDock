@@ -109,3 +109,9 @@ Web driver address or program (empty = none): = Web sürücü adresi veya progra
 Driver link = Sürücü bağlantısı
 Open driver (double-click) = Sürücüyü aç (çift tık)
 Driver link... = Sürücü bağlantısı...
+Show DPI changes = DPI değişince göster
+DPI values... = DPI değerleri...
+DPI values = DPI değerleri
+DPI of each level, in order, separated by commas (e.g. 400, 800, 1600, 3200): = Her kademenin DPI değeri, sırayla, virgülle ayrılmış (ör. 400, 800, 1600, 3200):
+This mouse has {count} levels. = Bu mouse'ta {count} kademe var.
+Enter numbers between 50 and 50000, separated by commas. = 50 ile 50000 arasındaki sayıları virgülle ayırarak gir.

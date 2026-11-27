@@ -10,11 +10,36 @@ constexpr wchar_t kWindowClass[] = L"BatteryDockRenameDialog";
 
 struct EditorState {
     bool link = false;  // custom build: the same editor asks for a driver link (web address or program)
+    bool dpi = false;   // custom build: ... or the DPI of each level
+    int levels = 0;
     std::wstring initial;
     std::wstring result;
     HWND edit = nullptr;
     bool accepted = false;
 };
+
+// Up to 8 numbers between 50 and 50000, separated by commas (empty is fine: forget the values).
+bool ValidDpiList(const std::wstring& text) {
+    int count = 0;
+    std::wstring cur;
+    bool ok = true;
+    auto flush = [&]() {
+        size_t a = cur.find_first_not_of(L" \t"), b = cur.find_last_not_of(L" \t");
+        std::wstring t = a == std::wstring::npos ? L"" : cur.substr(a, b - a + 1);
+        cur.clear();
+        if (t.empty()) return;
+        if (t.size() > 5 || t.find_first_not_of(L"0123456789") != std::wstring::npos) { ok = false; return; }
+        int n = std::stoi(t);
+        if (n < 50 || n > 50000) ok = false;
+        count++;
+    };
+    for (wchar_t c : text) {
+        if (c == L',' || c == L';' || c == L'/') flush();
+        else cur.push_back(c);
+    }
+    flush();
+    return ok && count <= 8;
+}
 
 EditorState* State(HWND hwnd) {
     return reinterpret_cast<EditorState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -38,8 +63,12 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HINSTANCE inst = GetModuleHandleW(nullptr);
             const int dpi = GetDpiForWindow(hwnd);
             auto scale = [dpi](int v) { return MulDiv(v, dpi, 96); };
-            HWND label = CreateWindowExW(0, L"STATIC", state->link ? T(L"Web driver address or program (empty = none):") : T(L"Device display name:"),
-                                         WS_CHILD | WS_VISIBLE, scale(16), scale(18), scale(382), scale(22),
+            std::wstring prompt = state->dpi ? std::wstring(T(L"DPI of each level, in order, separated by commas (e.g. 400, 800, 1600, 3200):"))
+                                  : state->link ? T(L"Web driver address or program (empty = none):") : T(L"Device display name:");
+            if (state->dpi && state->levels > 0)
+                prompt += L"\n" + TF(L"This mouse has {count} levels.", { { L"count", std::to_wstring(state->levels) } });
+            HWND label = CreateWindowExW(0, L"STATIC", prompt.c_str(),
+                                         WS_CHILD | WS_VISIBLE, scale(16), scale(state->dpi ? 10 : 18), scale(382), scale(state->dpi ? 34 : 22),
                                          hwnd, nullptr, inst, nullptr);
             state->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->initial.c_str(),
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -57,7 +86,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetControlFont(state->edit);
             SetControlFont(save);
             SetControlFont(cancel);
-            SendMessageW(state->edit, EM_SETLIMITTEXT, state->link ? 1024 : aliases::kMaxNameLength, 0);
+            SendMessageW(state->edit, EM_SETLIMITTEXT, state->link ? 1024 : state->dpi ? 64 : aliases::kMaxNameLength, 0);
             SetFocus(state->edit);
             SendMessageW(state->edit, EM_SETSEL, 0, -1);
             return 0;
@@ -68,7 +97,12 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, 0);
                 GetWindowTextW(state->edit, buffer.data(), (int)buffer.size());
                 std::wstring name = aliases::Trim(buffer.data());
-                if (!state->link && !aliases::ValidName(name)) {
+                if (state->dpi && !ValidDpiList(name)) {
+                    MessageBoxW(hwnd, T(L"Enter numbers between 50 and 50000, separated by commas."), T(L"DPI values"), MB_OK | MB_ICONINFORMATION);
+                    SetFocus(state->edit);
+                    return 0;
+                }
+                if (!state->link && !state->dpi && !aliases::ValidName(name)) {
                     MessageBoxW(hwnd, T(L"Enter a name (1-64 characters)."), T(L"Rename device"), MB_OK | MB_ICONINFORMATION);
                     SetFocus(state->edit);
                     return 0;
@@ -86,7 +120,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 }  // namespace
 
-static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring& result, bool link);
+static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring& result, bool link, bool dpi = false, int levels = 0);
 
 bool PromptDeviceName(HWND owner, const std::wstring& currentName, std::wstring& result) {
     return PromptImpl(owner, currentName, result, false);
@@ -96,7 +130,11 @@ bool PromptDeviceLink(HWND owner, const std::wstring& currentLink, std::wstring&
     return PromptImpl(owner, currentLink, result, true);
 }
 
-static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring& result, bool link) {
+bool PromptDpiValues(HWND owner, const std::wstring& current, int levels, std::wstring& result) {
+    return PromptImpl(owner, current, result, false, true, levels);
+}
+
+static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring& result, bool link, bool dpi, int levels) {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.hInstance = inst;
@@ -106,8 +144,8 @@ static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
-    const int dpi = owner ? GetDpiForWindow(owner) : 96;
-    const int width = MulDiv(420, dpi, 96), height = MulDiv(157, dpi, 96);
+    const int scaleDpi = owner ? GetDpiForWindow(owner) : 96;
+    const int width = MulDiv(420, scaleDpi, 96), height = MulDiv(157, scaleDpi, 96);
     POINT p{};
     GetCursorPos(&p);
     HMONITOR monitor = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
@@ -123,8 +161,10 @@ static bool PromptImpl(HWND owner, const std::wstring& currentName, std::wstring
     EditorState state;
     state.initial = currentName;
     state.link = link;
+    state.dpi = dpi;
+    state.levels = levels;
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW, kWindowClass,
-                                   link ? T(L"Driver link") : T(L"Rename device"), WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                                   dpi ? T(L"DPI values") : link ? T(L"Driver link") : T(L"Rename device"), WS_CAPTION | WS_SYSMENU | WS_POPUP,
                                    x, y, width, height, owner, nullptr, inst, &state);
     if (!dialog) return false;
 

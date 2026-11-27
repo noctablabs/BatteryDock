@@ -20,6 +20,8 @@ struct DeviceStatus {
     int  millivolts = 0;       // battery voltage when reported (0 = unknown)
     int  graceSec   = 0;       // keep showing the last value this long if the device stops answering
     unsigned short vid = 0;    // USB / Bluetooth HID vendor id when known (picks the brand color)
+    int  dpiStage   = -1;      // custom build: active DPI stage, 0-based (-1 = not reported)
+    int  dpiCount   = 0;       // custom build: number of DPI stages (0 = not reported)
 };
 
 // Queries every supported device. Blocking (can take a second or two); call from a worker thread.

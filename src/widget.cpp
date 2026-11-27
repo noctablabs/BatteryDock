@@ -978,6 +978,19 @@ void Destroy() {
 
 bool Alive() { return g_wnd && IsWindow(g_wnd) && g_taskbar && IsWindow(g_taskbar); }
 
+bool ItemScreenRect(int index, RECT& out) {
+    if (!Alive() || !IsWindowVisible(g_wnd)) return false;
+    auto it = g_hit.find(g_wnd);
+    if (it == g_hit.end() || index < 0 || index >= (int)it->second.size()) return false;
+    RECT r = it->second[(size_t)index];
+    if (r.left > r.right || r.top > r.bottom) return false;
+    RECT w;
+    if (!GetWindowRect(g_wnd, &w)) return false;
+    OffsetRect(&r, w.left, w.top);
+    out = r;
+    return true;
+}
+
 void SetItems(const std::vector<WidgetItem>& items, const std::wstring& tooltip) {
     g_items = items;
     if (tooltip != g_tipText && g_tip) {

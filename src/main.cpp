@@ -29,12 +29,15 @@
 #include "widget.h"
 #include "update_win.h"
 #include "update_apply.h"
+#include "dpi_watch.h"
+#include "dpi_osd.h"
 
 namespace {
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_RESULTS = WM_APP + 2;
 constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
+constexpr UINT WM_DPI_CHANGE = WM_APP + 4;  // custom build: dpiwatch::Change* in lParam
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
 constexpr UINT_PTR TIMER_ALERT_ICON = 3;
@@ -56,7 +59,8 @@ enum MenuId : UINT {
 };
 enum DeviceCmd : UINT {
     DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_RENAME, DEV_RESET_NAME, DEV_HISTORY,
-    DEV_ALERT_FIRST = 6, DEV_ALERT_DEFAULT = DEV_ALERT_FIRST + 8, DEV_ALERT_OFF, DEV_COLOR, DEV_COLOR_RESET, DEV_LINK, DEV_OPEN, DEV_STRIDE = 20
+    DEV_ALERT_FIRST = 6, DEV_ALERT_DEFAULT = DEV_ALERT_FIRST + 8, DEV_ALERT_OFF, DEV_COLOR, DEV_COLOR_RESET, DEV_LINK, DEV_OPEN,
+    DEV_DPI_BUBBLE, DEV_DPI_VALUES, DEV_STRIDE = 24
 };
 
 const wchar_t* kAppName = L"BatteryDock";
@@ -205,6 +209,77 @@ void SaveLinks() {
     }
     multi.push_back(L'\0');
     RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceLinks", REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
+}
+
+// Custom build: DPI of each level per device, HKCU\...\DeviceDpi "key<TAB>400,800,1600"; and whether the
+// DPI bubble is shown at all (DpiBubble, on by default).
+std::map<std::wstring, std::vector<int>> g_dpiValues;
+bool g_dpiBubble = true;
+
+std::vector<int> ParseDpiList(const std::wstring& text, bool* ok = nullptr) {
+    std::vector<int> v;
+    bool good = true;
+    std::wstring cur;
+    auto flush = [&]() {
+        size_t a = cur.find_first_not_of(L" \t"), b = cur.find_last_not_of(L" \t");
+        std::wstring t = a == std::wstring::npos ? L"" : cur.substr(a, b - a + 1);
+        cur.clear();
+        if (t.empty()) return;
+        if (t.size() > 5 || t.find_first_not_of(L"0123456789") != std::wstring::npos) { good = false; return; }
+        int n = std::stoi(t);
+        if (n < 50 || n > 50000) { good = false; return; }
+        v.push_back(n);
+    };
+    for (wchar_t c : text) {
+        if (c == L',' || c == L';' || c == L'/' ) flush();
+        else cur.push_back(c);
+    }
+    flush();
+    if (v.size() > 8) good = false;
+    if (ok) *ok = good;
+    return v;
+}
+
+std::wstring FormatDpiList(const std::vector<int>& v) {
+    std::wstring s;
+    for (size_t i = 0; i < v.size(); i++) s += (i ? L", " : L"") + std::to_wstring(v[i]);
+    return s;
+}
+
+void LoadDpiValues() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceDpi", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS)
+        return;
+    if (size < 2 * sizeof(wchar_t) || size > 64 * 1024 || size % sizeof(wchar_t)) return;
+    std::vector<wchar_t> data(size / sizeof(wchar_t) + 1, 0);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceDpi", RRF_RT_REG_MULTI_SZ, nullptr, data.data(), &size) != ERROR_SUCCESS)
+        return;
+    for (const wchar_t* p = data.data(); *p; p += wcslen(p) + 1) {
+        std::wstring item = p;
+        size_t tab = item.find(L'\t');
+        if (tab == std::wstring::npos || tab == 0) continue;
+        bool ok = false;
+        std::vector<int> v = ParseDpiList(item.substr(tab + 1), &ok);
+        if (ok && !v.empty()) g_dpiValues[item.substr(0, tab)] = v;
+    }
+}
+
+void SaveDpiValues() {
+    std::wstring multi;
+    for (const auto& [key, v] : g_dpiValues) {
+        multi += key + L"\t" + FormatDpiList(v);
+        multi.push_back(L'\0');
+    }
+    if (multi.empty()) {
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            RegDeleteValueW(k, L"DeviceDpi");
+            RegCloseKey(k);
+        }
+        return;
+    }
+    multi.push_back(L'\0');
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceDpi", REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
 }
 
 std::wstring Expand(const wchar_t* path) {
@@ -1021,6 +1096,93 @@ void MoveEntry(const std::wstring& key, int dir) {
     UpdateWidget();
 }
 
+// Custom build: DPI bubble -------------------------------------------------------------------------
+
+// "DPI değişince göster" is offered for every mouse (the watcher finds the ones that can tell their DPI);
+// "DPI değerleri..." only for mice that report a level but whose values could not be read.
+bool IsMouse(const TrayEntry& e) { return e.st.kind == DeviceKind::Mouse; }
+bool HasDpiLevels(const TrayEntry& e) { return e.st.dpiCount > 0; }
+
+void EditDpiValues(const std::wstring& key) {
+    auto e = g_entries.find(key);
+    if (e == g_entries.end()) return;
+    auto cur = g_dpiValues.find(key);
+    std::wstring chosen;
+    if (!PromptDpiValues(g_hwnd, cur != g_dpiValues.end() ? FormatDpiList(cur->second) : L"", e->second.st.dpiCount, chosen)) return;
+    std::vector<int> v = ParseDpiList(chosen);
+    if (v.empty()) g_dpiValues.erase(key);
+    else g_dpiValues[key] = v;
+    SaveDpiValues();
+}
+
+void SetDpiBubble(bool on) {
+    g_dpiBubble = on;
+    SaveBoolSetting(L"DpiBubble", on);
+    dpiwatch::SetEnabled(on);
+}
+
+void RefreshSoon(UINT ms);
+
+// The DPI watcher saw a mouse answer again. If its battery entry still shows it asleep or stale (dimmed),
+// read the batteries now rather than at the next poll (at most every 10 s).
+void MouseAwake(const dpiwatch::Change& c) {
+    static ULONGLONG last = 0;
+    TrayEntry* e = nullptr;
+    auto it = g_entries.find(c.key);
+    if (it != g_entries.end()) e = &it->second;
+    if (!e)
+        for (auto& [k, x] : g_entries)
+            if (x.st.vid == c.vid && x.st.kind == DeviceKind::Mouse) { e = &x; break; }
+    if (!e || !(e->st.asleep || e->st.percent < 0 || !e->st.connected)) return;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 10000) return;
+    last = now;
+    RefreshSoon(200);
+}
+
+void ShowDpiBubble(const dpiwatch::Change& c) {
+    if (!g_dpiBubble) return;
+    // The watcher's key normally matches the battery entry; when it does not (the same mouse on cable and
+    // receiver, or a battery reading under another key), take the shown mouse of the same brand.
+    TrayEntry* e = nullptr;
+    auto it = g_entries.find(c.key);
+    if (it != g_entries.end()) e = &it->second;
+    if (!e) {
+        for (TrayEntry* x : OrderedEntries(true))
+            if (x->st.vid == c.vid && x->st.kind == DeviceKind::Mouse) { e = x; break; }
+    }
+    std::wstring key = e ? e->st.key : c.key;
+    if (e && c.stage >= 0) {
+        e->st.dpiStage = c.stage;
+        e->st.dpiCount = c.count;
+    }
+    dpiosd::Info info;
+    info.stage = c.stage;
+    info.count = c.stage >= 0 ? c.count : 0;
+    std::wstring level = c.stage >= 0 && c.count > 0 ? std::to_wstring(c.stage + 1) + L" / " + std::to_wstring(c.count) : L"";
+    int dpi = c.dpi;
+    auto vals = g_dpiValues.find(key);  // values typed in by hand win over what the mouse reported
+    if (vals != g_dpiValues.end() && c.stage >= 0 && c.stage < (int)vals->second.size()) dpi = vals->second[(size_t)c.stage];
+    if (dpi > 0) {
+        info.big = std::to_wstring(dpi) + L" DPI";
+        info.small = level;
+    } else {
+        info.big = L"DPI " + level;
+    }
+    info.light = g_lightTaskbar;
+    if (const COLORREF* col = CustomColorFor(key)) info.accent = *col;
+    else if (e && AccentFor(e->st) != Accent::None) {
+        BrandColor b = AccentColor(AccentFor(e->st), g_lightTaskbar);
+        info.accent = RGB(b.r, b.g, b.b);
+    } else info.accent = g_lightTaskbar ? RGB(0, 120, 212) : RGB(96, 205, 255);
+    if (g_useWidget) {
+        auto pos = std::find(g_widgetKeys.begin(), g_widgetKeys.end(), key);
+        if (pos != g_widgetKeys.end())
+            info.haveAnchor = widget::ItemScreenRect((int)(pos - g_widgetKeys.begin()), info.anchor);
+    }
+    dpiosd::Show(g_inst, info);
+}
+
 void ShowMenu() {
     ApplyMenuTheme(g_lightTaskbar);
     HMENU m = CreatePopupMenu();
@@ -1043,6 +1205,13 @@ void ShowMenu() {
         AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(sub, MF_STRING, base + DEV_OPEN, T(L"Open driver (double-click)"));
         AppendMenuW(sub, MF_STRING | (g_links.count(k) ? MF_CHECKED : 0), base + DEV_LINK, T(L"Driver link..."));
+        if (IsMouse(*e)) {
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(sub, MF_STRING | (g_dpiBubble ? MF_CHECKED : 0), base + DEV_DPI_BUBBLE, T(L"Show DPI changes"));
+            if (HasDpiLevels(*e))
+                AppendMenuW(sub, MF_STRING | (g_dpiValues.count(k) ? MF_CHECKED : 0) | (g_dpiBubble ? 0 : MF_GRAYED),
+                            base + DEV_DPI_VALUES, T(L"DPI values..."));
+        }
         AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(sub, MF_STRING | (CustomColorFor(k) ? MF_CHECKED : 0), base + DEV_COLOR, T(L"Icon color..."));
         AppendMenuW(sub, MF_STRING | (CustomColorFor(k) ? 0 : MF_GRAYED), base + DEV_COLOR_RESET, T(L"Default icon color"));
@@ -1190,6 +1359,8 @@ void ShowMenu() {
                     case DEV_COLOR: PickDeviceColor(key); break;
                     case DEV_LINK: EditDeviceLink(key); break;
                     case DEV_OPEN: OpenDeviceDriver(key); break;
+                    case DEV_DPI_BUBBLE: SetDpiBubble(!g_dpiBubble); break;
+                    case DEV_DPI_VALUES: EditDpiValues(key); break;
                     case DEV_COLOR_RESET: ResetDeviceColor(key); break;
                     case DEV_ALERT_DEFAULT: SetAlertOverride(key, alerts::kUseDefault); break;
                     case DEV_ALERT_OFF: SetAlertOverride(key, alerts::kDisabled); break;
@@ -1295,6 +1466,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 case NIN_KEYSELECT: ShowMenu(); break;
             }
             return 0;
+        case WM_DPI_CHANGE: {
+            auto* c = reinterpret_cast<dpiwatch::Change*>(lp);
+            if (c && c->awake) MouseAwake(*c);
+            else if (c) ShowDpiBubble(*c);
+            delete c;
+            return 0;
+        }
         case WM_WIDGET_CLICK:
             if (wp == 1 && lp >= 0 && (size_t)lp < g_widgetKeys.size()) OpenDeviceDriver(g_widgetKeys[(size_t)lp]);
             else ShowMenu();
@@ -1303,10 +1481,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp) DestroyWindow(h);
             return 0;
         case WM_DEVICECHANGE:
-            if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) RefreshSoon(2500);
+            if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE) { RefreshSoon(2500); dpiwatch::Rescan(); }
             return TRUE;
         case WM_POWERBROADCAST:
-            if (wp == PBT_APMRESUMEAUTOMATIC) RefreshSoon(5000);
+            if (wp == PBT_APMRESUMEAUTOMATIC) { RefreshSoon(5000); dpiwatch::Rescan(); }
             return TRUE;
         case WM_TIMER:
             if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
@@ -1328,6 +1506,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(h, TIMER_ALERT_ICON);
             if (g_alertIconAdded) { TrayDelete(ALERT_ICON_ID); g_alertIconAdded = false; }
             widget::Destroy();
+            dpiwatch::Stop();
+            dpiosd::Destroy();
             SetEvent(g_stopEvt);
             if (g_worker) WaitForSingleObject(g_worker, 5000);
             for (auto& [k, e] : g_entries) {
@@ -1522,12 +1702,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     LoadAliases();
     LoadCustomColors();
     LoadLinks();
+    LoadDpiValues();
+    g_dpiBubble = LoadBoolSetting(L"DpiBubble", true);
     LoadAlertThresholds();
     battery_history::Initialize(g_demo);
     Reconcile();
     UpdatePlaceholder();  // something to click on until the first poll finishes
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+    if (!g_demo) {
+        dpiwatch::SetEnabled(g_dpiBubble);
+        dpiwatch::Start(g_hwnd, WM_DPI_CHANGE);
+    }
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -1537,6 +1723,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
     // drain results posted after shutdown started
     while (PeekMessageW(&m, nullptr, WM_RESULTS, WM_RESULTS, PM_REMOVE)) delete reinterpret_cast<std::vector<DeviceStatus>*>(m.lParam);
+    while (PeekMessageW(&m, nullptr, WM_DPI_CHANGE, WM_DPI_CHANGE, PM_REMOVE)) delete reinterpret_cast<dpiwatch::Change*>(m.lParam);
     if (notify) UnregisterDeviceNotification(notify);
     if (g_worker) CloseHandle(g_worker);
     ReleaseMutex(mutex);

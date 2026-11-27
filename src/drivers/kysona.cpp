@@ -15,8 +15,11 @@
 // Redragon ids from github.com/EliottV17/redragon-battery-omarchy and github.com/pingpingjinping/g49-web-control.
 // The older dual-mode M913 on the Areson 25A7:FA07 / FA08 receiver is handled by areson.cpp.
 #include "drivers.h"
+#include "dpi_source.h"
 
 #include <algorithm>
+#include <memory>
+#include <mutex>
 
 namespace {
 
@@ -54,19 +57,26 @@ BYTE Checksum(const BYTE* b) {
     return (BYTE)(0x55 - sum);
 }
 
-// Sends `cmd` and waits for its checksummed reply.
+// The battery poll and the DPI watcher talk to the same receiver over separate handles. The 8K receivers
+// (e.g. SCYROX 8K Dongle 3554:F5F7) answer one request at a time, so overlapping requests from the two
+// threads made both time out: every exchange holds this lock.
+std::mutex g_io;
+
+// Sends `cmd` and waits for its checksummed reply (up to 800 ms: Scyrox's S-Center allows 700 ms).
 bool Query(HidDev& d, BYTE cmd, std::vector<BYTE>& r) {
+    std::lock_guard<std::mutex> lock(g_io);
     std::vector<BYTE> req(17, 0);
     req[0] = 0x08;
     req[1] = cmd;
     req[16] = Checksum(req.data());
     d.Flush();
     if (!d.Write(req)) return false;
-    ULONGLONG end = GetTickCount64() + 500;
+    ULONGLONG end = GetTickCount64() + 800;
     for (;;) {
         int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
         if (left <= 0 || d.Read(r, left) < 17) return false;
-        if (r[0] == 0x08 && r[1] == cmd && r[16] == Checksum(r.data())) return true;
+        if (r[0] == 0x08 && r[1] == cmd && r[16] == Checksum(r.data()) && !std::equal(req.begin(), req.end(), r.begin()))
+            return true;
     }
 }
 
@@ -121,7 +131,7 @@ void PollKysona(PollContext& ctx) {
                     answered = true;
                     s.connected = r[6] != 0;
                 }
-                if ((!answered || s.connected) && Query(d, 0x04, r)) {
+                if ((!answered || s.connected) && (Query(d, 0x04, r) || (answered && Query(d, 0x04, r)))) {
                     answered = true;
                     s.connected = true;
                     if (r[6] <= 100) s.percent = r[6];
@@ -154,6 +164,161 @@ void PollKysona(PollContext& ctx) {
                 }
                 break;
             }
+        }
+    }
+}
+
+// ---- DPI source (custom build) ---------------------------------------------------------------------
+// The same 17-byte protocol reads the mouse's settings memory (command 08 "ReadFlashData"), as the
+// Compx-based web drivers do (Scyrox S-Center "Control HUB WEB", www.scyrox.net/assets/index-*.js;
+// MouseDock's DpiProtocol.cs, MIT):
+//   request [08][08][00][addr hi][addr lo][len][00 ...][checksum], reply the same header + data from [6].
+//   address 2 = number of DPI levels, 4 = active level (0-based); each byte is followed by 55 - byte.
+// The level values are coded per sensor, so they are decoded only for Scyrox mice (S-Center's cfg.json
+// lists PAW3950 and PAW3955 models): PAW3955 levels at 6912 + 6 * i, [x lo][x hi][y lo][y hi][flags][chk],
+// value = (x + ((flags >> 2 & 3) << 16) + 1); PAW3950 levels at 12 + 4 * i, [x][y][flags][chk],
+// value = (x + ((flags >> 2 & 3) << 8) + 1) * 50; flags bit 0 and bit 1 each double the value; every
+// block's bytes add up to 55 (hex). Other brands on this protocol code their values differently: they
+// get the level only (and "DPI values..." to type them in). Read-only: command 08 only reads.
+
+namespace {
+
+bool ReadFlash(HidDev& d, int addr, int len, std::vector<BYTE>& data) {
+    std::lock_guard<std::mutex> lock(g_io);
+    std::vector<BYTE> req(17, 0);
+    req[0] = 0x08;
+    req[1] = 0x08;
+    req[3] = (BYTE)(addr >> 8);
+    req[4] = (BYTE)addr;
+    req[5] = (BYTE)len;
+    req[16] = Checksum(req.data());
+    d.Flush();
+    if (!d.Write(req)) return false;
+    ULONGLONG end = GetTickCount64() + 700;
+    std::vector<BYTE> r;
+    for (;;) {
+        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+        if (left <= 0 || d.Read(r, left) < 17) return false;
+        if (r[0] != 0x08 || r[1] != 0x08 || r[16] != Checksum(r.data())) continue;
+        if (std::equal(req.begin(), req.end(), r.begin())) continue;  // an echo of the request
+        if (r[3] != req[3] || r[4] != req[4] || r[5] != len) continue;
+        if (r[2] != 0) return false;  // error status: mouse not answering
+        data.assign(r.begin() + 6, r.begin() + 6 + len);
+        return true;
+    }
+}
+
+bool Sum55(const std::vector<BYTE>& b) {
+    unsigned s = 0;
+    for (BYTE v : b) s += v;
+    return (s & 0xFF) == 0x55;
+}
+
+bool ReadPair(HidDev& d, int addr, int& value) {
+    std::vector<BYTE> b;
+    if (!ReadFlash(d, addr, 2, b) || !Sum55(b)) return false;
+    value = b[0];
+    return true;
+}
+
+bool IsScyrox(USHORT vid, USHORT pid) {
+    return vid == 0x3554 && (pid == 0xF5F4 || pid == 0xF5F6 || pid == 0xF5F7 || pid == 0xF515 || pid == 0xF517);
+}
+
+int Doubled(int v, int flags) { return v * ((flags & 1) ? 2 : 1) * ((flags & 2) ? 2 : 1); }
+
+// Scyrox level values; empty when they do not read back as valid blocks.
+std::vector<int> ReadScyroxLevels(HidDev& d, int count) {
+    std::vector<int> v;
+    std::vector<BYTE> b;
+    for (int i = 0; i < count; i++) {  // PAW3955
+        if (!ReadFlash(d, 6912 + 6 * i, 6, b) || !Sum55(b)) { v.clear(); break; }
+        int value = Doubled(b[0] + (b[1] << 8) + (((b[4] >> 2) & 3) << 16) + 1, b[4] & 3);
+        if (value < 50 || value > 84000) { v.clear(); break; }
+        v.push_back(value);
+    }
+    if (!v.empty()) return v;
+    for (int i = 0; i < count; i++) {  // PAW3950
+        if (!ReadFlash(d, 12 + 4 * i, 4, b) || !Sum55(b)) return {};
+        int value = Doubled((b[0] + (((b[2] >> 2) & 3) << 8) + 1) * 50, b[2] & 3);
+        if (value < 50 || value > 60000) return {};
+        v.push_back(value);
+    }
+    return v;
+}
+
+class CompxDpi : public DpiSource {
+public:
+    CompxDpi(const HidColl& c) : c_(c) {}
+    bool Open() { return d_.Open(c_); }
+    bool Probe() { std::vector<BYTE> r; return Query(d_, 0x03, r); }  // the receiver speaks this protocol (mouse may sleep)
+    std::wstring Key() const override { return L"kysona:" + Hex4(c_.vid) + L":" + Hex4(KeyPid(c_.vid, c_.pid)); }
+    USHORT Vid() const override { return c_.vid; }
+    unsigned IntervalMs() const override { return 350; }
+    // The mouse pushes [08][0A] "status changed" when a setting changes (S-Center reads the active DPI
+    // level when bit 0 of [6] is set): read at once instead of waiting for the next turn.
+    bool Wait(unsigned ms, HANDLE stop) override {
+        ULONGLONG end = GetTickCount64() + ms;
+        std::vector<BYTE> r;
+        for (;;) {
+            if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return false;
+            int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+            if (left <= 0) return false;
+            if (d_.Read(r, std::min(left, 50)) >= 17 && r[0] == 0x08 && r[1] == 0x0A && r[16] == Checksum(r.data()) &&
+                (r[6] & 1))
+                return true;
+        }
+    }
+    bool Read(DpiReading& out) override {
+        int active = 0;
+        if (!ReadPair(d_, 4, active)) return false;
+        if (count_ <= 0 || active >= count_) {
+            int c = 0;
+            if (!ReadPair(d_, 2, c) || c < 1 || c > 8) return false;
+            if (c != count_) { count_ = c; levels_.clear(); tries_ = 0; }
+        }
+        if (active >= count_) return false;
+        if (IsScyrox(c_.vid, c_.pid) && levels_.empty() && tries_ < 3) {
+            levels_ = ReadScyroxLevels(d_, count_);
+            if (levels_.empty()) tries_++;
+        }
+        out.stage = active;
+        out.count = count_;
+        out.dpi = active < (int)levels_.size() ? levels_[(size_t)active] : 0;
+        return true;
+    }
+private:
+    HidColl c_;
+    HidDev d_;
+    int count_ = 0, tries_ = 0;
+    std::vector<int> levels_;
+};
+
+}  // namespace
+
+void FindCompxDpi(const std::vector<HidColl>& colls, DpiSources& out) {
+    std::vector<std::pair<USHORT, USHORT>> products;
+    for (const auto& c : colls) {
+        bool vendor = c.vid == 0x3554 || c.vid == 0x373B || c.vid == 0x3770 || c.vid == 0x33E4 || c.vid == 0x3710 || c.vid == 0x35BB;
+        if (vendor && std::find(products.begin(), products.end(), std::make_pair(c.vid, c.pid)) == products.end())
+            products.push_back({ c.vid, c.pid });
+    }
+    for (auto [vid, pid] : products) {
+        // Same exclusions as the battery poll: devices that speak other protocols never get these frames.
+        if (vid == 0x373B && (pid == 0x11CA || pid == 0x11CB || pid == 0x1203 || pid == 0x1204 || pid == 0x1178)) continue;
+        if (vid == 0x3554 && (pid == 0xFA09 || pid == 0xFB40)) continue;
+        if (vid == 0x35BB && !IsHecateMouse(pid)) continue;
+        std::vector<const HidColl*> cs;
+        for (const auto& c : colls)
+            if (c.vid == vid && c.pid == pid &&
+                ((c.outLen() == 17 && c.inLen() == 17) || (c.page() >= 0xFF00 && c.outLen() >= 17 && c.inLen() >= 17)))
+                cs.push_back(&c);
+        std::stable_sort(cs.begin(), cs.end(), [](const HidColl* a, const HidColl* b) {
+            return (a->page() == 0xFF02 && a->usage() == 0x0002) > (b->page() == 0xFF02 && b->usage() == 0x0002);
+        });
+        for (const HidColl* c : cs) {
+            auto s = std::make_unique<CompxDpi>(*c);
+            if (s->Open() && s->Probe()) { out.push_back(std::move(s)); break; }
         }
     }
 }

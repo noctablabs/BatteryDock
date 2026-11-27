@@ -1,6 +1,6 @@
 # Builds dist\BatteryDock-Setup-<version>.exe and dist\BatteryDock-<version>-portable.zip.
 # Needs: BatteryDock.exe already built (make / build.bat) and Inno Setup 6 or 7 installed.
-param([string]$Version = "1.0.0")
+param([string]$Version = "1.1.0")
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root

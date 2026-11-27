@@ -43,6 +43,9 @@ struct MonitorOption {
 };
 // The monitors other than the main one that have a horizontal taskbar (empty with one monitor).
 std::vector<MonitorOption> OtherMonitors();
+// Custom build: screen rectangle of one shown device (index into the last SetItems list) on the main
+// taskbar's strip; false when the strip is not shown.
+bool ItemScreenRect(int index, RECT& out);
 // Re-checks the taskbar layout and moves the widget if needed; call about once a second.
 // Returns false when the taskbar it was attached to is gone.
 bool Reposition();

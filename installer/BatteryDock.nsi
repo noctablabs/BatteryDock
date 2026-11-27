@@ -1,8 +1,8 @@
 ; BatteryDock installer (NSIS 3). Per-user install, no admin rights needed.
-; Build: makensis -DVERSION=1.0.0 installer/BatteryDock.nsi   (expects BatteryDock.exe in the repo root)
+; Build: makensis -DVERSION=1.1.0 installer/BatteryDock.nsi   (expects BatteryDock.exe in the repo root)
 Unicode true
 !ifndef VERSION
-  !define VERSION "1.0.0"
+  !define VERSION "1.1.0"
 !endif
 !define APP "BatteryDock"
 !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
